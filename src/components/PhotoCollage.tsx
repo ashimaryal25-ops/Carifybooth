@@ -576,22 +576,61 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
   };
 
   /**
-   * Compose a full 4×6 sheet with two identical strips side-by-side.
+   * Compose a full 4×6 sheet with two identical strips side-by-side, so the
+   * printer's centre cut yields two complete 2×6 strips (a classic photobooth
+   * pair) instead of bisecting a single strip.
    *
-   * Gutter math:
-   *   outer margin = G/2,  center gutter = G
-   *   Total = G/2 + stripFitW + G + stripFitW + G/2 = 2·stripFitW + 2·G
-   *
-   * After the printer cuts down the exact centre, each strip ends up with G/2
-   * of background colour on both its left and right edges — perfectly equal.
+   * Built from the captured strip PNG (`stripDataUrl`), NOT from the live
+   * decor canvas: by the time the guest taps Print we are on the "final" view
+   * and the decor canvas is unmounted (decorCanvasRef.current === null). Reading
+   * that null canvas is what silently dropped this to a single strip, which the
+   * DNP queue then cover-scaled to the whole 4×6 and cut through the middle.
    */
-  const composeForPrint = useCallback(() => {
-    const stripCanvas = decorCanvasRef.current;
-    if (!stripCanvas) return null;
+  const composeForPrint = useCallback(async (): Promise<string | null> => {
+    if (!stripDataUrl) return null;
 
-    // 4:6 portrait sheet, height matches the strip so no vertical scaling.
+    const strip = new Image();
+    strip.src = stripDataUrl;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        strip.onload = () => resolve();
+        strip.onerror = () => reject(new Error("strip image failed to load"));
+      });
+    } catch {
+      return null;
+    }
+
+    // 4:6 portrait sheet.
     const sheetH = 1800;
     const sheetW = 1200;
+    const halfW = sheetW / 2; // 600 — the physical 2-inch cut line
+
+    // The DNP centre cut lands exactly on the sheet centre (x=600) with an
+    // essentially zero-width kerf — verified with a printed ruler: a 1px line
+    // drawn at x=600 comes out split across BOTH strips' inner edges. So nothing
+    // is trimmed; the earlier strips lost their inner frame only because the
+    // border there was too thin and sat right under the blade.
+    //
+    // Fix: give each 2-inch strip an EQUAL pink margin on both sides by centring
+    // it inside its own 600px half. Inner border then matches the outer one and
+    // is comfortably clear of the cut. The scale is uniform (photos keep their
+    // proportions and sharpness) — the strip is just a little smaller inside an
+    // even frame.
+    //
+    // ►► THESE ARE THE KNOBS ◄◄  (px, ~290px/inch so 1px ≈ 0.088mm.) The blade
+    // shaves a little off each strip's INNER edge at the seam, so the inner
+    // margin is set LARGER than the outer one — after the cut they come out
+    // equal. Tune by eye on a print: if the inner border is still thinner, raise
+    // INNER_MARGIN; if it's now fatter, lower it. OUTER_MARGIN sets the overall
+    // frame thickness. After changing, rebuild (npm run build) or run the booth
+    // in -Dev mode, and HARD-REFRESH the tab (Ctrl+Shift+R) before reprinting.
+    const OUTER_MARGIN = 40; // pink outside each strip (outer edge)
+    const INNER_MARGIN = 18; // pink from strip to the centre cut
+
+    const stripTargetW = halfW - OUTER_MARGIN - INNER_MARGIN;
+    const scale = stripTargetW / strip.width; // uniform — no distortion
+    const stripTargetH = strip.height * scale;
+    const yTop = (sheetH - stripTargetH) / 2; // centre vertically; even top/bottom margin too
 
     const sheet = document.createElement("canvas");
     sheet.width = sheetW;
@@ -599,27 +638,27 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
     const ctx = sheet.getContext("2d");
     if (!ctx) return null;
 
-    // Fill the entire sheet with the strip background so there is no white
-    // paper anywhere — the coloured border bleeds to every edge.
+    // Fill the entire sheet with the strip background so there is no white paper
+    // anywhere — the coloured border bleeds to every edge.
     ctx.fillStyle = bgColor;
     ctx.fillRect(0, 0, sheetW, sheetH);
 
-    // Left strip
-    ctx.drawImage(stripCanvas, 0, 0, 600, 1800);
+    // Left strip: OUTER_MARGIN from the left paper edge, inner edge short of centre.
+    ctx.drawImage(strip, OUTER_MARGIN, yTop, stripTargetW, stripTargetH);
 
-    // Right strip (identical)
-    ctx.drawImage(stripCanvas, 600, 0, 600, 1800);
+    // Right strip (identical): INNER_MARGIN to the right of centre.
+    ctx.drawImage(strip, halfW + INNER_MARGIN, yTop, stripTargetW, stripTargetH);
 
     return sheet.toDataURL("image/png");
-  }, [bgColor]);
+  }, [bgColor, stripDataUrl]);
 
   const handlePrint = async () => {
     if (!stripDataUrl) return;
     setPrintState("printing");
     setPrintError(null);
     try {
-      // Compose the full 4×6 sheet with two strips and proper gutter math.
-      const printDataUrl = composeForPrint() ?? stripDataUrl;
+      // Compose the full 4×6 sheet with two identical strips side-by-side.
+      const printDataUrl = (await composeForPrint()) ?? stripDataUrl;
 
       const res = await fetch("/api/collage/print", {
         method: "POST",

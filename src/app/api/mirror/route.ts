@@ -43,8 +43,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid event" }, { status: 400 });
   }
 
-  if (type === "captured-photo") {
-    relay.events = relay.events.filter((event) => event.type !== "captured-photo");
+  // Keep only the latest of these high-frequency / single-value events so the 40-slot
+  // buffer never fills with stale frames or heartbeats (hands-frame is Ghost Runner's
+  // live camera feed relayed from the mirror at ~10fps).
+  if (type === "captured-photo" || type === "hands-frame" || type === "hands-stream-start") {
+    relay.events = relay.events.filter((event) => event.type !== type);
   }
 
   const event: MirrorEvent = { ...body, id: relay.nextId++, target, type };

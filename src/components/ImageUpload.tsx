@@ -14,15 +14,11 @@ interface ImageUploadProps {
   samplePhoto: string;
 }
 
-type CameraStatus = "idle" | "starting" | "active" | "error";
-
 export function ImageUpload({ photo, onUpload, onChooseAnother, onViewSample, samplePhoto }: ImageUploadProps) {
-  const [cameraStatus, setCameraStatus] = useState<CameraStatus>("idle");
   const [countdown, setCountdown] = useState<number | null>(null);
   const mirrorChannelRef = useRef<BroadcastChannel | null>(null);
   const captureRequestIdRef = useRef<string | null>(null);
   const captureTimeoutRef = useRef<number | null>(null);
-  const readyTimeoutRef = useRef<number | null>(null);
   const lastRelayIdRef = useRef(0);
 
   const sendToMirror = useCallback((message: Record<string, unknown>) => {
@@ -42,41 +38,24 @@ export function ImageUpload({ photo, onUpload, onChooseAnother, onViewSample, sa
   }, []);
 
   const startCamera = useCallback(() => {
-    setCameraStatus("starting");
-
-    // Laptop testing: no mirror window to wait on, the stream is already live.
+    // Optimistic, like the collage flow: enable capture immediately instead of waiting
+    // for a `mirror-ready` handshake. That event is easy to miss (the relay can rotate
+    // or dedupe it out, or it arrives after a fixed timeout), which left the button
+    // stuck disabled. If the mirror really isn't there, the capture-request times out
+    // and surfaces the error at capture time — same as the collage.
     if (isDevCamera()) {
-      setCameraStatus("active");
       return;
     }
 
     sendToMirror({ type: "mirror-start" });
     sendToMirror({ type: "mirror-ping" });
-
-    if (readyTimeoutRef.current !== null) {
-      window.clearTimeout(readyTimeoutRef.current);
-    }
-    readyTimeoutRef.current = window.setTimeout(() => {
-      setCameraStatus((status) => {
-        if (status === "starting") {
-          return "error";
-        }
-        return status;
-      });
-    }, 3500);
   }, [sendToMirror]);
 
   const capturePhoto = useCallback(() => {
-    if (cameraStatus !== "active") {
-      return;
-    }
-
     if (isDevCamera()) {
       const dataUrl = captureDevPhoto();
       if (dataUrl) {
         onUpload(dataUrl);
-      } else {
-        setCameraStatus("error");
       }
       return;
     }
@@ -91,42 +70,28 @@ export function ImageUpload({ photo, onUpload, onChooseAnother, onViewSample, sa
     captureRequestIdRef.current = requestId;
     sendToMirror({ type: "capture-request", requestId });
 
+    // If the shot doesn't come back, just drop the pending request so the guest can
+    // try again — no latching into a disabled state.
     captureTimeoutRef.current = window.setTimeout(() => {
       captureRequestIdRef.current = null;
-      setCameraStatus("error");
-    }, 3500);
-  }, [cameraStatus, clearCaptureTimeout, onUpload, sendToMirror]);
+    }, 5000);
+  }, [clearCaptureTimeout, onUpload, sendToMirror]);
 
   const handleMirrorMessage = useCallback((data: Record<string, unknown>) => {
-    if (data.type === "mirror-ready") {
-      if (readyTimeoutRef.current !== null) {
-        window.clearTimeout(readyTimeoutRef.current);
-        readyTimeoutRef.current = null;
-      }
-      setCameraStatus("active");
-      return;
-    }
-
-    if (data.type === "mirror-error") {
-      setCameraStatus("error");
-      return;
-    }
-
+    // We no longer gate the button on `mirror-ready`/`mirror-error` — the flow is
+    // optimistic like the collage. Only the returned photo matters here.
     if (data.type === "captured-photo" && data.requestId === captureRequestIdRef.current && typeof data.dataUrl === "string") {
       clearCaptureTimeout();
       captureRequestIdRef.current = null;
       setCountdown(null);
-      setCameraStatus("active");
       onUpload(data.dataUrl);
     }
   }, [clearCaptureTimeout, onUpload]);
 
   useEffect(() => {
-    if (typeof BroadcastChannel === "undefined") {
-      window.setTimeout(() => {
-        setCameraStatus("error");
-      }, 0);
-    } else {
+    // BroadcastChannel is the fast same-browser path; when it's unavailable we still
+    // capture fine over the /api/mirror relay poll below, so this is best-effort only.
+    if (typeof BroadcastChannel !== "undefined") {
       const channel = new BroadcastChannel("cardifybooth-mirror");
       mirrorChannelRef.current = channel;
       channel.onmessage = (event) => handleMirrorMessage(event.data || {});
@@ -136,9 +101,6 @@ export function ImageUpload({ photo, onUpload, onChooseAnother, onViewSample, sa
 
     return () => {
       clearCaptureTimeout();
-      if (readyTimeoutRef.current !== null) {
-        window.clearTimeout(readyTimeoutRef.current);
-      }
       mirrorChannelRef.current?.close();
       mirrorChannelRef.current = null;
     };
@@ -240,7 +202,7 @@ export function ImageUpload({ photo, onUpload, onChooseAnother, onViewSample, sa
       <button
         type="button"
         onClick={() => setCountdown(3)}
-        disabled={cameraStatus !== "active" || countdown !== null}
+        disabled={countdown !== null}
         className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-[#c25a1f] text-base font-bold text-white shadow-[0_3px_12px_rgba(112,54,0,0.24)] transition hover:bg-[#a84c17] disabled:cursor-not-allowed disabled:opacity-50"
       >
         <Camera size={20} />

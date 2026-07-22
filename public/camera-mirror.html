@@ -145,7 +145,50 @@
       });
     }
 
+    // --- Live frame stream for Ghost Runner hand tracking -------------------
+    // The single webcam is owned by this mirror, so the game can't open its own
+    // (NotReadableError: Device in use). Instead we push it small raw frames over
+    // BroadcastChannel and it feeds them to MediaPipe. Frames are UN-mirrored so the
+    // game's hand-x math matches a directly-attached webcam. BroadcastChannel only
+    // (never the HTTP relay) — 15fps JPEGs would swamp the relay's 40-event buffer.
+    // NOTE: this only READS copies of the live video into an offscreen canvas — it
+    // never touches the mirror's own <video>/stream, so the live feed keeps showing
+    // uninterrupted. Frames go out over BOTH BroadcastChannel (fast, same-browser) and
+    // the /api/mirror relay (works when the game window isn't in the same browser),
+    // because the game may only be reachable over one of them.
+    let handsStreamTimer = null;
+    let handsCanvas = null;
+    let lastHandsRequestAt = 0;
+    function startHandsStream() {
+      lastHandsRequestAt = Date.now();
+      if (handsStreamTimer) return;
+      handsCanvas = document.createElement('canvas');
+      handsCanvas.width = 256;
+      handsCanvas.height = 192;
+      const hctx = handsCanvas.getContext('2d');
+      handsStreamTimer = window.setInterval(() => {
+        // Auto-stop when the game stops asking (it heartbeats ~1/s while it needs us).
+        if (Date.now() - lastHandsRequestAt > 3000) { stopHandsStream(); return; }
+        if (!streamIsLive() || v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !v.videoWidth) return;
+        hctx.drawImage(v, 0, 0, handsCanvas.width, handsCanvas.height);
+        const dataUrl = handsCanvas.toDataURL('image/jpeg', 0.6);
+        if (mirrorCh) mirrorCh.postMessage({ type: 'hands-frame', dataUrl });
+        fetch('/api/mirror', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target: 'kiosk', type: 'hands-frame', dataUrl }),
+        }).catch(() => {});
+      }, 100);
+    }
+    function stopHandsStream() {
+      window.clearInterval(handsStreamTimer);
+      handsStreamTimer = null;
+      handsCanvas = null;
+    }
+
     function handleCommand(d) {
+      if (d.type === 'hands-stream-start') { startHandsStream(); return; }
+      if (d.type === 'hands-stream-stop') { stopHandsStream(); return; }
       if (d.type === 'mirror-ping') {
         if (streamIsLive()) sendToKiosk({ type: 'mirror-ready' });
         else start();

@@ -289,19 +289,19 @@ export function BoothApp() {
                 backgroundImage: "url('/cardify/home-bg.png')",
               }}
             >
-              <span className="relative z-10 mx-auto -mt-6 max-w-[300px] rounded-2xl px-8 py-10 text-center"
+              <span className="relative z-10 mx-auto -mt-6 max-w-[240px] rounded-2xl px-6 py-7 text-center"
                 style={{
                   backgroundColor: "rgba(230,168,55,0.94)",
                   backdropFilter: "blur(18px)",
                   WebkitBackdropFilter: "blur(18px)",
                 }}
               >
-                <span className="block text-[36px] font-black uppercase leading-[0.9] tracking-tight text-[var(--gc-black)] drop-shadow-[0_2px_10px_rgba(255,244,222,0.85)]">
+                <span className="block text-[30px] font-black uppercase leading-[0.9] tracking-tight text-[var(--gc-black)] drop-shadow-[0_2px_10px_rgba(255,244,222,0.85)]">
                   Trading
                   <br />
                   Card
                 </span>
-                <span className="mt-3 block text-sm font-black uppercase tracking-[0.2em] text-[var(--gc-black)]/70 drop-shadow-[0_1px_6px_rgba(255,244,222,0.8)]">
+                <span className="mt-2.5 block text-xs font-black uppercase tracking-[0.2em] text-[var(--gc-black)]/70 drop-shadow-[0_1px_6px_rgba(255,244,222,0.8)]">
                   Gettysburg themed
                 </span>
               </span>

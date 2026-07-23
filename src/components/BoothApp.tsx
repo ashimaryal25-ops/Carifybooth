@@ -53,8 +53,8 @@ export function BoothApp() {
   // when there are no pointer/key events because the guest is just posing.
   const [activityNonce, setActivityNonce] = useState(0);
 
-  // 2-minute idle timeout → shows a "Continue session?" popup.
-  // If the user doesn't interact within 30s of the popup, reset to home.
+  // 30-second idle timeout → shows a "Continue session?" popup.
+  // If the user doesn't interact within 15s of the popup, reset to home.
   // Never fires on "choose" (home) or "generating" since there's nothing to timeout.
   useEffect(() => {
     if (step === "choose" || step === "generating") {
@@ -75,15 +75,15 @@ export function BoothApp() {
 
     const showPopup = () => {
       setShowIdlePopup(true);
-      // 30s to respond or auto-reset
-      popupTimer = setTimeout(() => resetToHome(), 30000);
+      // 15s to respond or auto-reset
+      popupTimer = setTimeout(() => resetToHome(), 15000);
     };
 
     const resetTimer = () => {
       setShowIdlePopup(false);
       clearTimeout(idleTimer);
       clearTimeout(popupTimer);
-      idleTimer = setTimeout(showPopup, 120000);
+      idleTimer = setTimeout(showPopup, 30000);
     };
 
     const handleActivity = () => resetTimer();
@@ -312,14 +312,43 @@ export function BoothApp() {
             </button>
 
             {/* Quarter 2 — Photo Collage: the collage-strip mockup shown whole on a
-                navy that matches the image's own background, so it reads seamlessly. */}
+                navy that matches the image's own background, so it reads seamlessly.
+                The three labels are a CSS overlay (the baked-in text was misspelled
+                and has been erased from the art). The wrapper shrink-wraps to the
+                contained image, so each label stays pinned under its strip at any
+                display aspect ratio. */}
             <button
               type="button"
               onClick={() => setStep("collage")}
               aria-label="Photo Collage — build a keepsake photo strip"
-              className="group overflow-hidden bg-contain bg-center bg-no-repeat transition-all hover:brightness-110 active:brightness-95"
-              style={{ backgroundColor: "#05225a", backgroundImage: "url('/cardify/collage-tile.png')" }}
-            />
+              className="group relative flex items-center justify-center overflow-hidden transition-all hover:brightness-110 active:brightness-95"
+              style={{ backgroundColor: "#05225a" }}
+            >
+              <span className="relative inline-flex max-h-full max-w-full">
+                <img
+                  src="/cardify/collage-tile.png"
+                  alt=""
+                  className="block max-h-full max-w-full object-contain"
+                />
+                {[
+                  { label: "2-Strip Collage", left: "20.3%" },
+                  { label: "3-Strip Collage", left: "52.6%" },
+                  { label: "4-Strip Collage", left: "82.4%" },
+                ].map(({ label, left }) => (
+                  <span
+                    key={label}
+                    className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap font-serif italic text-white drop-shadow-[0_1px_6px_rgba(0,0,0,0.35)]"
+                    style={{
+                      left,
+                      top: "93.5%",
+                      fontSize: "clamp(0.8rem, 1.7vw, 1.9rem)",
+                    }}
+                  >
+                    {label}
+                  </span>
+                ))}
+              </span>
+            </button>
 
             {/* Quarter 3 — Ghost Runner (live, running in-quadrant) */}
             <div ref={gamePanelRef} className="group relative overflow-hidden bg-[#16213e]">
@@ -524,7 +553,7 @@ export function BoothApp() {
         )}
       </div>
 
-      {/* Kiosk idle popup — appears after 2 min of inactivity, auto-resets in 30s */}
+      {/* Kiosk idle popup — appears after 30s of inactivity, auto-resets in 15s */}
       {showIdlePopup && (
         <div
           className="fixed inset-0 z-[9999] grid place-items-center bg-black/60 backdrop-blur-sm"

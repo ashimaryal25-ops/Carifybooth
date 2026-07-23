@@ -12,6 +12,8 @@ let leaderboardAnimationProgress = 0;
 const nameInput = document.getElementById("nameInput");
 let gameStarted = false;
 let pulseValue = 0;
+let handBobPulse = 0;
+let handSteerPulse = 0;
 const ctx = canvas.getContext("2d");
 
 // ground line position
@@ -37,9 +39,15 @@ let gameSpeed = 5;
 let score = 0;
 
 let currentLevel = 1;
-let transitioning = false;
-let transitionTimer = 0;
 let lvl2GraceTimer = 0;
+
+// Pre-level instruction overlay: shown for INSTRUCTIONS_DURATION frames before
+// level 1 starts (after the initial tap) and again before level 2 starts (after
+// clearing level 1). Purely timer-driven so it works unattended on a kiosk.
+let showingInstructions = false;
+let instructionsLevel = 1;
+let instructionsTimer = 0;
+const INSTRUCTIONS_DURATION = 900; // 15 seconds at 60fps
 
 const startMusic = new Audio("Assets/start_sound.wav");
 startMusic.loop = true;
@@ -91,6 +99,9 @@ gameBgVideo.addEventListener("ended", function() { gameBgVideo.currentTime = 0; 
 
 // gifData stores: { frames: [{cropped canvas}], delays, currentFrame, lastTime }
 const gifData = {};
+
+const handPoseImg = new Image();
+handPoseImg.src = "Assets/hand_pose_jump.png";
 
 function getBounds(data, w, h) {
   let minX = w, maxX = 0, minY = h, maxY = 0;
@@ -249,8 +260,16 @@ function reportActivity() {
 }
 
 function jump(force, isAuto = false) {
+  // instructions are timer-driven only - ignore taps/space/hand-gestures while showing
+  if (showingInstructions) return;
+
   if (!isAuto && !audioUnlocked) {
     audioUnlocked = true;
+    startMusic.muted = false;
+    lvl2BgSound.muted = false;
+    hitSound.muted = false;
+    jumpSound.muted = false;
+    score20Sound.muted = false;
     hitSound.play().then(function() { hitSound.pause(); }).catch(function() {});
     jumpSound.play().then(function() { jumpSound.pause(); }).catch(function() {});
     score20Sound.play().then(function() { score20Sound.pause(); }).catch(function() {});
@@ -267,14 +286,11 @@ function jump(force, isAuto = false) {
   
   if (!gameStarted) {
     if(!isAuto){
-      gameStarted = true;
-      score = 0;
-      obstacles = [];
-      spawnObstacle();
-      bgVideo.pause();
-      gameBgVideo.play();
-      startMusic.play().catch(function(e){});
+      showingInstructions = true;
+      instructionsLevel = 1;
+      instructionsTimer = INSTRUCTIONS_DURATION;
     }
+    return;
   }
   
   let f = force || jumpForce;
@@ -310,12 +326,11 @@ window.addEventListener("message", e => {
 // Remove this block once Level 2 testing is done.
 document.addEventListener("keydown", function(e) {
   if (e.key === "2" && !enteringName) {
+    showingInstructions = false;
     gameStarted = true;
     gameOver = false;
     enteringName = false;
     showingLeaderBoard = false;
-    transitioning = false;
-    transitionTimer = 0;
     currentLevel = 2;
     score20Played = true;
     obstacles = [];
@@ -346,7 +361,10 @@ let handY = null;
 let handX = null;
 let prevHandY = null;
 let handXHistory = [];
-const HAND_X_HISTORY_SIZE = 5;
+// Shorter averaging window = less lag in level 2 steering. Palm-center tracking
+// (wrist + middle-finger-base averaged below) already cancels most raw jitter,
+// so we don't need a long window to stay smooth.
+const HAND_X_HISTORY_SIZE = 3;
 let framesSinceHandSeen = 0;
 
 const webcamVideo = document.createElement("video");
@@ -524,7 +542,7 @@ handsModel.onResults(function(results) {
 
     if (prevHandY !== null) {
       const dy = prevHandY - handY;
-      if (dy > 0.03 && gameStarted && !gameOver && !ghost.jumping && !transitioning) {
+      if (dy > 0.03 && gameStarted && !gameOver && !ghost.jumping && !showingInstructions) {
         reportActivity();
         jump(jumpForce);
       }
@@ -624,7 +642,7 @@ function updateGhost() {
   if (currentLevel === 2) {
     if (handX !== null) {
       const targetX = (1 - handX) * canvas.width - ghost.width / 2;
-      if (Math.abs(targetX - ghost.x) > 2) {
+      if (Math.abs(targetX - ghost.x) > 1) {
         ghost.x = targetX;
       }
     }
@@ -655,10 +673,11 @@ function updateObstacles() {
     if (obstacles.length > 0 && obstacles[0].x + obstacles[0].width < 0) {
       obstacles.shift();
       score++;
-      if (score >= 20 && !score20Played) {
+      if (score >= 10 && !score20Played) {
         score20Played = true;
-        transitioning = true;
-        transitionTimer = 600;
+        showingInstructions = true;
+        instructionsLevel = 2;
+        instructionsTimer = INSTRUCTIONS_DURATION;
         startMusic.pause();
         startMusic.currentTime = 0;
         score20Sound.play();
@@ -753,20 +772,134 @@ function drawGameOver() {
   ctx.textAlign = "left";
 }
 
-function drawTransition() {
-  ctx.fillStyle = "rgba(0,0,0,0.85)";
+// Pre-level instruction screen. Shown automatically (no input needed) for
+// INSTRUCTIONS_DURATION frames before level 1 starts and again before level 2
+// starts, so anyone walking up to the kiosk can read how to play.
+function drawInstructions() {
+  ctx.fillStyle = "rgba(8,8,10,0.93)";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = "#ffffff";
-  ctx.font = "bold 56px Arial";
   ctx.textAlign = "center";
-  ctx.fillText("Congratulations!", canvas.width / 2, canvas.height / 2 - 80);
-  ctx.font = "36px Arial";
-  ctx.fillText("Get Ready for Level 2!", canvas.width / 2, canvas.height / 2 - 20);
-  let secondsLeft = Math.ceil(transitionTimer / 60);
-  ctx.font = "bold 80px Arial";
-  ctx.fillText(secondsLeft, canvas.width / 2, canvas.height / 2 + 80);
-  ctx.font = "24px Arial";
-  ctx.fillText("seconds remaining", canvas.width / 2, canvas.height / 2 + 130);
+
+  // running cursor - each element advances it by its own height plus a gap,
+  // so nothing below can ever overlap something drawn above it
+  let y = 190;
+
+  if (instructionsLevel === 1) {
+    ctx.font = "bold 60px Arial";
+    ctx.fillText("Level 1: The Chase", canvas.width / 2, y);
+    y += 90;
+
+    const imgW = 200, imgH = 175;
+    const imgX = canvas.width / 2 - imgW / 2;
+    const imgY = y;
+    handBobPulse += 0.06;
+    const bobOffset = Math.sin(handBobPulse) * 22;
+    if (handPoseImg.complete && handPoseImg.naturalWidth) {
+      ctx.drawImage(handPoseImg, imgX, imgY + bobOffset, imgW, imgH);
+    }
+
+    // upward arrow to the right of the image, showing which way to move it
+    ctx.strokeStyle = "#39FF14";
+    ctx.fillStyle = "#39FF14";
+    ctx.lineWidth = 6;
+    const arrowX = imgX + imgW + 60;
+    const arrowTopY = imgY + 10;
+    const arrowBottomY = imgY + imgH - 10;
+    ctx.beginPath();
+    ctx.moveTo(arrowX, arrowBottomY);
+    ctx.lineTo(arrowX, arrowTopY + 20);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(arrowX - 18, arrowTopY + 30);
+    ctx.lineTo(arrowX, arrowTopY);
+    ctx.lineTo(arrowX + 18, arrowTopY + 30);
+    ctx.closePath();
+    ctx.fill();
+
+    y = imgY + imgH + 45; // clear of the image (plus its bob range)
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "26px Arial";
+    ctx.fillText("Hold your hand like this, then raise it to jump", canvas.width / 2, y);
+    y += 40;
+    ctx.fillText("Obstacles come from the right \u2014 jump to clear them", canvas.width / 2, y);
+    y += 40;
+    ctx.fillText("Clear 10 to advance to Level 2", canvas.width / 2, y);
+    y += 70;
+  } else {
+    ctx.font = "bold 60px Arial";
+    ctx.fillText("Level 2: No Way Out", canvas.width / 2, y);
+    y += 90;
+
+    const imgW = 170, imgH = 149;
+    const colLeftX = canvas.width / 2 - 260;
+    const colRightX = canvas.width / 2 + 260;
+    const rowImgY = y;
+
+    // --- left column: jump demo, same as level 1 (hand bobs up/down) ---
+    handBobPulse += 0.06;
+    const bobOffsetY = Math.sin(handBobPulse) * 18;
+    if (handPoseImg.complete && handPoseImg.naturalWidth) {
+      ctx.drawImage(handPoseImg, colLeftX - imgW / 2, rowImgY + bobOffsetY, imgW, imgH);
+    }
+    ctx.strokeStyle = "#39FF14";
+    ctx.fillStyle = "#39FF14";
+    ctx.lineWidth = 5;
+    const upArrowX = colLeftX + imgW / 2 + 45;
+    const upArrowTop = rowImgY + 5;
+    const upArrowBottom = rowImgY + imgH - 5;
+    ctx.beginPath();
+    ctx.moveTo(upArrowX, upArrowBottom);
+    ctx.lineTo(upArrowX, upArrowTop + 18);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(upArrowX - 14, upArrowTop + 26);
+    ctx.lineTo(upArrowX, upArrowTop);
+    ctx.lineTo(upArrowX + 14, upArrowTop + 26);
+    ctx.closePath();
+    ctx.fill();
+
+    // --- right column: steer demo (hand bobs left/right, double-headed arrow below) ---
+    handSteerPulse += 0.06;
+    const bobOffsetX = Math.sin(handSteerPulse) * 20;
+    if (handPoseImg.complete && handPoseImg.naturalWidth) {
+      ctx.drawImage(handPoseImg, colRightX - imgW / 2 + bobOffsetX, rowImgY, imgW, imgH);
+    }
+    const steerArrowY = rowImgY + imgH + 35;
+    const steerArrowLeftX = colRightX - 55;
+    const steerArrowRightX = colRightX + 55;
+    ctx.beginPath();
+    ctx.moveTo(steerArrowLeftX, steerArrowY);
+    ctx.lineTo(steerArrowRightX, steerArrowY);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(steerArrowLeftX + 16, steerArrowY - 12);
+    ctx.lineTo(steerArrowLeftX, steerArrowY);
+    ctx.lineTo(steerArrowLeftX + 16, steerArrowY + 12);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(steerArrowRightX - 16, steerArrowY - 12);
+    ctx.lineTo(steerArrowRightX, steerArrowY);
+    ctx.lineTo(steerArrowRightX - 16, steerArrowY + 12);
+    ctx.stroke();
+
+    y = rowImgY + imgH + 85; // clear both columns - the steer arrow (below its image) is the taller one
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "22px Arial";
+    ctx.fillText("Raise your hand to jump", colLeftX, y);
+    ctx.fillText("Move your hand left & right to steer", colRightX, y);
+    y += 50;
+
+    ctx.font = "26px Arial";
+    ctx.fillText("Obstacles fall from above and rush in from both sides", canvas.width / 2, y);
+    y += 70;
+  }
+
+  let secondsLeft = Math.ceil(instructionsTimer / 60);
+  ctx.font = "bold 40px Arial";
+  ctx.fillText("Starting in " + secondsLeft + "...", canvas.width / 2, y);
   ctx.textAlign = "left";
 }
 
@@ -841,7 +974,7 @@ function drawStartScreen() {
   let alpha = (Math.sin(pulseValue) + 1) / 2;
   ctx.fillStyle = "rgba(255,255,255," + alpha + ")";
   ctx.font = "28px Arial";
-  ctx.fillText("Press Space/Tap to Start", canvas.width / 2, canvas.height / 2 + 20);
+  ctx.fillText("Tap to Start", canvas.width / 2, canvas.height / 2 + 20);
   ctx.textAlign = "left";
 }
 
@@ -852,8 +985,8 @@ function resetGame() {
   gameStarted = false;
   score20Played = false;
   currentLevel = 1;
-  transitioning = false;
-  transitionTimer = 0;
+  showingInstructions = false;
+  instructionsTimer = 0;
   lvl2GraceTimer = 0;
   handXHistory = [];
   ghost.x = 100;
@@ -909,25 +1042,34 @@ function drawLvl2Background() {
 function gameLoop(timestamp) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   updateGifs(timestamp);
-  if (!gameStarted) {
+  if (showingInstructions) {
+    drawInstructions();
+    instructionsTimer--;
+    if (instructionsTimer <= 0) {
+      showingInstructions = false;
+      if (instructionsLevel === 1) {
+        gameStarted = true;
+        score = 0;
+        obstacles = [];
+        spawnObstacle();
+        bgVideo.pause();
+        gameBgVideo.play();
+        startMusic.play().catch(function(e) {});
+      } else {
+        currentLevel = 2;
+        lvl2GraceTimer = 90;
+        handXHistory = [];
+        score20Sound.pause();
+        score20Sound.currentTime = 0;
+        lvl2BgSound.play();
+        lvl2BgVideo.play();
+        obstacles = [];
+        score = 0;
+      }
+    }
+  } else if (!gameStarted) {
     drawStartScreen();
     drawGround();
-  } else if (transitioning) {
-    drawGameBackground();
-    drawTransition();
-    transitionTimer--;
-    if (transitionTimer <= 0) {
-      transitioning = false;
-      currentLevel = 2;
-      lvl2GraceTimer = 90;
-      handXHistory = [];
-      score20Sound.pause();
-      score20Sound.currentTime = 0;
-      lvl2BgSound.play();
-      lvl2BgVideo.play();
-      obstacles = [];
-      score = 0;
-    }
   } else if (enteringName) {
     drawGameBackground();
     drawGround(); drawGhost(); drawObstacles(); drawScore(); drawNameInput();

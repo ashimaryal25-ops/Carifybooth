@@ -23,10 +23,17 @@
  *     DoubleStrip4x6 = two strips per 4x6) instead of window.print().
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Home, Printer } from "lucide-react";
 import QRCode from "qrcode";
 import { captureDevPhoto, isDevCamera } from "@/lib/dev-camera";
+import {
+  findFrame,
+  framesForCount,
+  type FrameBleed,
+  type FrameSlot,
+  type FrameTheme,
+} from "@/data/frame-themes";
 
 type CollageView = "layout" | "camera" | "decor" | "final";
 type FilterName = "none" | "traditional" | "sepia" | "soft" | "y2k" | "vivid";
@@ -68,6 +75,104 @@ const STRIP_PHOTO_W = STRIP_W - STRIP_PADDING_X * 2;
 function slotPhotoHeight(slotCount: number): number {
   const contentH = STRIP_H - STRIP_TOP_MARGIN - STRIP_FOOTER_H;
   return slotCount > 0 ? (contentH - (slotCount - 1) * STRIP_GAP) / slotCount : contentH;
+}
+
+/**
+ * Draw one captured photo into `dest`, cover-cropped and reframed exactly the
+ * way the plain-colour strip does it (see renderStrip for why the zoom and the
+ * downward bias exist), mirrored like a real booth.
+ *
+ * `cropAspect` is kept separate from the destination's own aspect so the custom
+ * frames can crop to what the guest saw on screen and then stretch that into a
+ * print slot with a slightly different shape — Chloe's print sheets squeeze the
+ * slots horizontally on purpose to cancel the printer's stretch.
+ */
+function drawPhotoInto(
+  ctx: CanvasRenderingContext2D,
+  src: CanvasImageSource & { width: number; height: number },
+  dest: FrameSlot,
+  cropAspect: number,
+  filterName: FilterName,
+) {
+  let sw = src.width;
+  let sh = src.width / cropAspect;
+  if (sh > src.height) {
+    sh = src.height;
+    sw = src.height * cropAspect;
+  }
+  sw /= CROP_ZOOM;
+  sh /= CROP_ZOOM;
+  const sx = (src.width - sw) / 2;
+  const sy = (src.height - sh) * VERTICAL_CROP_BIAS;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(dest.x, dest.y, dest.w, dest.h);
+  ctx.clip();
+  ctx.filter = canvasFilter(filterName);
+  ctx.translate(dest.x + dest.w, dest.y);
+  ctx.scale(-1, 1);
+  ctx.drawImage(src, sx, sy, sw, sh, 0, 0, dest.w, dest.h);
+  ctx.restore();
+}
+
+/**
+ * Paint the artwork's outermost opaque pixels outward into its transparent
+ * edge bands. Every one of Chloe's print sheets stops ~20px short of the top
+ * edge (two stop ~50px short on the right); without this those bands reach the
+ * paper as white slivers along the strip edges.
+ */
+function paintFrameBleed(
+  ctx: CanvasRenderingContext2D,
+  art: HTMLImageElement,
+  bleed: FrameBleed,
+  destW: number,
+  destH: number,
+) {
+  const sx = art.naturalWidth / destW;
+  const sy = art.naturalHeight / destH;
+  const { top, bottom, left, right } = bleed;
+  if (top > 0) {
+    ctx.drawImage(art, 0, top * sy, art.naturalWidth, 1, 0, 0, destW, top);
+  }
+  if (bottom > 0) {
+    const srcY = art.naturalHeight - bottom * sy - 1;
+    ctx.drawImage(art, 0, srcY, art.naturalWidth, 1, 0, destH - bottom, destW, bottom);
+  }
+  if (left > 0) {
+    ctx.drawImage(art, left * sx, 0, 1, art.naturalHeight, 0, 0, left, destH);
+  }
+  if (right > 0) {
+    const srcX = art.naturalWidth - right * sx - 1;
+    ctx.drawImage(art, srcX, 0, 1, art.naturalHeight, destW - right, 0, right, destH);
+  }
+}
+
+/** Stickers are placed in STRIP_W x STRIP_H space; `scale`/`offsetX` map them
+ *  onto a print sheet half. */
+function drawStickers(
+  ctx: CanvasRenderingContext2D,
+  stickers: Sticker[],
+  scale = 1,
+  offsetX = 0,
+) {
+  ctx.save();
+  stickers.forEach((s) => {
+    ctx.font = `${s.size * scale}px Arial`;
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "center";
+    ctx.fillText(s.emoji, offsetX + s.x * scale, s.y * scale);
+  });
+  ctx.restore();
+}
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`frame image failed to load: ${src}`));
+    img.src = src;
+  });
 }
 
 // Her palette.
@@ -119,6 +224,10 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
   const [filter, setFilter] = useState<FilterName>("none");
   const [bgColor, setBgColor] = useState(DEFAULT_STRIP_COLOR);
   const [stickers, setStickers] = useState<Sticker[]>([]);
+  // null = the plain background-colour strip. Anything else is one of Chloe's
+  // custom frames; the two paths are independent all the way to the printer.
+  const [frameKey, setFrameKey] = useState<string | null>(null);
+  const [frameImg, setFrameImg] = useState<HTMLImageElement | null>(null);
 
   const [countdown, setCountdown] = useState<number | null>(null);
   const [previews, setPreviews] = useState<string[]>([]);
@@ -348,6 +457,32 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
     };
   }, [view, slots, retakeNonce, requestMirrorPhoto, sendToMirror]);
 
+  // --- Custom frames --------------------------------------------------------
+  // A frame only exists for some photo counts, so the selection is resolved
+  // against the current slot count and silently drops back to the plain strip
+  // when the guest switches to a count this theme was not drawn for.
+  const availableFrames = useMemo(() => framesForCount(slots), [slots]);
+  const activeFrame = useMemo(
+    () => (frameKey ? findFrame(frameKey, slots) : undefined),
+    [frameKey, slots],
+  );
+
+  // Preload the on-screen frame art; renderStrip re-runs once it is decoded.
+  useEffect(() => {
+    if (!activeFrame) return;
+    let cancelled = false;
+    loadImage(activeFrame.single.src)
+      .then((img) => {
+        if (!cancelled) setFrameImg(img);
+      })
+      .catch(() => {
+        if (!cancelled) setFrameImg(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFrame]);
+
   // --- Strip rendering (direct port of renderPhotoStripCanvas) --------------
   const renderStrip = useCallback(() => {
     const canvas = decorCanvasRef.current;
@@ -357,10 +492,37 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const photos = photosRef.current;
+
+    // Custom frame: the photos go BEHIND the art and show through its
+    // transparent windows. The frame already carries its own background and
+    // branding, so none of the plain-strip chrome below runs. The src check
+    // keeps a half-loaded previous theme from being drawn into the new one.
+    if (activeFrame && frameImg && frameImg.src.endsWith(activeFrame.single.src)) {
+      const fx = STRIP_W / activeFrame.single.w;
+      const fy = STRIP_H / activeFrame.single.h;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, STRIP_W, STRIP_H);
+      paintFrameBleed(ctx, frameImg, activeFrame.single.bleed, STRIP_W, STRIP_H);
+      activeFrame.single.slots.forEach((slot, i) => {
+        const src = photos[i];
+        if (!src) return;
+        drawPhotoInto(
+          ctx,
+          src,
+          { x: slot.x * fx, y: slot.y * fy, w: slot.w * fx, h: slot.h * fy },
+          slot.w / slot.h,
+          filter,
+        );
+      });
+      ctx.drawImage(frameImg, 0, 0, STRIP_W, STRIP_H);
+      drawStickers(ctx, stickers);
+      return;
+    }
+
     ctx.fillStyle = bgColor;
     ctx.fillRect(0, 0, STRIP_W, STRIP_H);
 
-    const photos = photosRef.current;
     const slotCount = photos.length;
 
     // Fill one fixed content band with N equal photos + equal gaps (shared with
@@ -430,15 +592,8 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
       ctx.drawImage(stripQrImg, qrX, qrY, qrSize, qrSize);
     }
 
-    ctx.save();
-    stickers.forEach((s) => {
-      ctx.font = `${s.size}px Arial`;
-      ctx.textBaseline = "middle";
-      ctx.textAlign = "center";
-      ctx.fillText(s.emoji, s.x, s.y);
-    });
-    ctx.restore();
-  }, [bgColor, filter, stickers, brandReady, stripQrReady]);
+    drawStickers(ctx, stickers);
+  }, [bgColor, filter, stickers, brandReady, stripQrReady, activeFrame, frameImg]);
 
   useEffect(() => {
     if (view === "decor") renderStrip();
@@ -652,13 +807,72 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
     return sheet.toDataURL("image/png");
   }, [bgColor, stripDataUrl]);
 
+  /**
+   * Custom-frame print path. Chloe's `backendstrip/` files are already complete
+   * 1200x1800 sheets: both strips laid out, the pattern bled across the centre
+   * seam, and the printer's edge compensation baked into the artwork by hand
+   * (measured on real prints). So this deliberately BYPASSES composeForPrint --
+   * no background fill, no 542px rescale, no OUTER/INNER inset. All we add are
+   * the photos and the guest's stickers.
+   *
+   * The print slots are narrower than the on-screen ones because that squeeze
+   * is part of the compensation, so each photo is cropped to the shape the
+   * guest saw on screen and then stretched into the print slot.
+   */
+  const composeFrameForPrint = useCallback(
+    async (frame: FrameTheme): Promise<string | null> => {
+      let art: HTMLImageElement;
+      try {
+        art = await loadImage(frame.print.src);
+      } catch {
+        return null;
+      }
+
+      const sheet = document.createElement("canvas");
+      sheet.width = frame.print.w;
+      sheet.height = frame.print.h;
+      const ctx = sheet.getContext("2d");
+      if (!ctx) return null;
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, sheet.width, sheet.height);
+      paintFrameBleed(ctx, art, frame.print.bleed, sheet.width, sheet.height);
+
+      const photos = photosRef.current;
+      const cropAspect = (i: number) => {
+        const s = frame.single.slots[i];
+        return s ? s.w / s.h : 1;
+      };
+      for (const side of ["left", "right"] as const) {
+        frame.print.slots[side].forEach((slot, i) => {
+          const src = photos[i];
+          if (src) drawPhotoInto(ctx, src, slot, cropAspect(i), filter);
+        });
+      }
+
+      ctx.drawImage(art, 0, 0, sheet.width, sheet.height);
+
+      // Stickers sit on top of the art, once per strip half.
+      const halfW = sheet.width / 2;
+      const scale = halfW / STRIP_W;
+      drawStickers(ctx, stickers, scale, 0);
+      drawStickers(ctx, stickers, scale, halfW);
+
+      return sheet.toDataURL("image/png");
+    },
+    [filter, stickers],
+  );
+
   const handlePrint = async () => {
     if (!stripDataUrl) return;
     setPrintState("printing");
     setPrintError(null);
     try {
-      // Compose the full 4×6 sheet with two identical strips side-by-side.
-      const printDataUrl = (await composeForPrint()) ?? stripDataUrl;
+      // Custom frames ship as ready-made 4×6 sheets; the plain-colour strip is
+      // composed here into the calibrated two-up sheet.
+      const printDataUrl =
+        (activeFrame ? await composeFrameForPrint(activeFrame) : await composeForPrint()) ??
+        stripDataUrl;
 
       const res = await fetch("/api/collage/print", {
         method: "POST",
@@ -1007,24 +1221,59 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
                 </div>
 
                 {/* STRIPS */}
-                <div className="flex flex-col items-start">
+                <div className="col-span-2 flex flex-col items-start">
                   <h3 className={heading}>Strips</h3>
-                  <div className="grid w-full grid-cols-2 gap-2.5">
+                  <div className="grid max-h-[240px] w-full grid-cols-6 gap-2.5 overflow-y-auto pr-1">
                     <button
                       type="button"
-                      className={glassBtn}
+                      onClick={() => setFrameKey(null)}
+                      className="flex flex-col items-center gap-1.5 rounded-[14px] border-2 bg-white/15 p-1.5 transition-transform hover:scale-105"
                       style={{
-                        background: ACCENT,
-                        borderColor: ACCENT,
-                        boxShadow: "0 0 10px rgba(0,34,255,0.4)",
+                        borderColor: !activeFrame ? ACCENT : "rgba(255,255,255,0.55)",
+                        boxShadow: !activeFrame ? "0 0 10px rgba(0,34,255,0.4)" : undefined,
                       }}
                     >
-                      Plain Clean
+                      <span
+                        className="h-[74px] w-[26px] rounded-[4px] border border-white/70"
+                        style={{ backgroundColor: bgColor }}
+                      />
+                      <span className="text-[10px] font-bold uppercase tracking-[0.5px] text-white">
+                        Plain
+                      </span>
                     </button>
-                    <p className="col-span-2 mt-1 text-[12px] italic text-white/70">
-                      Custom themes coming soon!
-                    </p>
+
+                    {availableFrames.map((f) => {
+                      const active = activeFrame?.key === f.key;
+                      return (
+                        <button
+                          key={f.key}
+                          type="button"
+                          onClick={() => setFrameKey(f.key)}
+                          className="flex flex-col items-center gap-1.5 rounded-[14px] border-2 bg-white/15 p-1.5 transition-transform hover:scale-105"
+                          style={{
+                            borderColor: active ? ACCENT : "rgba(255,255,255,0.55)",
+                            boxShadow: active ? "0 0 10px rgba(0,34,255,0.4)" : undefined,
+                          }}
+                        >
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={f.single.src}
+                            alt=""
+                            className="h-[74px] w-[26px] rounded-[4px] border border-white/70 object-cover"
+                          />
+                          <span className="text-center text-[10px] font-bold uppercase leading-tight tracking-[0.5px] text-white">
+                            {f.label}
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
+                  {activeFrame && (
+                    <p className="mt-2 text-[12px] italic text-white/70">
+                      Theme frames come with their own background — the frame colour is
+                      only used by the plain strip.
+                    </p>
+                  )}
                 </div>
               </div>
 

@@ -497,8 +497,13 @@ export function PhotoCollage({ onExit, onActivity }: PhotoCollageProps) {
     // Custom frame: the photos go BEHIND the art and show through its
     // transparent windows. The frame already carries its own background and
     // branding, so none of the plain-strip chrome below runs. The src check
-    // keeps a half-loaded previous theme from being drawn into the new one.
-    if (activeFrame && frameImg && frameImg.src.endsWith(activeFrame.single.src)) {
+    // keeps a half-loaded previous theme from being drawn into the new one
+    // (decoded because the browser percent-encodes the spaces in her filenames).
+    if (
+      activeFrame &&
+      frameImg &&
+      decodeURIComponent(frameImg.src).endsWith(activeFrame.single.src)
+    ) {
       const fx = STRIP_W / activeFrame.single.w;
       const fy = STRIP_H / activeFrame.single.h;
       ctx.fillStyle = "#ffffff";
